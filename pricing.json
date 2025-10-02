@@ -1,0 +1,35 @@
+{
+  "businessName": "Cars & Keys",
+  "timezone": "America/Chicago",
+  "hours": {
+    "mon": ["08:00-22:00"],
+    "tue": ["08:00-22:00"],
+    "wed": ["08:00-22:00"],
+    "thu": ["08:00-22:00"],
+    "fri": ["08:00-22:00"],
+    "sat": ["09:00-20:00"],
+    "sun": ["10:00-20:00"]
+  },
+  "afterHoursSurcharge": 40,
+  "travel": {
+    "includedMiles": 10,
+    "perMileAfter": 2.0,
+    "oneWay": true
+  },
+  "baseCalloutDay": 79,
+  "baseCalloutNight": 119,
+  "services": {
+    "lockout":               { "day": [79, 119],  "night": [119, 159] },
+    "duplicate_basic":       { "day": [59, 89],   "night": [89, 119] },
+    "duplicate_transponder": { "day": [129,179],  "night": [169,219] },
+    "all_keys_lost":         { "day": [199,349],  "night": [249,399] },
+    "fob_programming":       { "day": [99,149],   "night": [139,189] },
+    "laser_cut_surcharge": 60,
+    "euro_surcharge": 80
+  },
+  "notes": {
+    "taxIncluded": false,
+    "quotePolicy": "Quotes are ranges; final price confirmed on site after VIN/immobilizer check.",
+    "cancellation": "No fee if canceled before dispatch; $39 trip fee once technician is en route."
+  }
+}

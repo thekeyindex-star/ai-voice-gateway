@@ -1,0 +1,44 @@
+kgenerator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")   // comes from .env
+}
+
+model Business {
+  id         Int           @id @default(autoincrement())
+  name       String
+  timezone   String        @default("America/Chicago")
+  profile    Json          // hours, pricing, scripts, faq
+  numbers    PhoneNumber[]
+  leads      Lead[]
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+}
+
+model PhoneNumber {
+  id         Int       @id @default(autoincrement())
+  e164       String    @unique           // +16056100158
+  business   Business  @relation(fields: [businessId], references: [id])
+  businessId Int
+  createdAt  DateTime  @default(now())
+}
+
+model Lead {
+  id           Int       @id @default(autoincrement())
+  business     Business  @relation(fields: [businessId], references: [id])
+  businessId   Int
+  timestamp    DateTime  @default(now())
+  name         String?
+  phone        String?
+  year         String?
+  make         String?
+  model        String?
+  service      String?
+  zip          String?
+  type         String?   // "lead" | "voicemail"
+  recordingUrl String?
+  raw          String?
+}
