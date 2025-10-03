@@ -1,4 +1,4 @@
-// server.js — Twilio <-> OpenAI Realtime voice bridge (full, debug-friendly, CSV + 24/7)
+// server.js — Twilio <-> OpenAI Realtime voice bridge (full, debug logs, CSV + voicemail)
 require('dotenv').config()
 const express = require('express')
 const { WebSocketServer, WebSocket } = require('ws')
@@ -6,19 +6,8 @@ const fs = require('fs')
 const path = require('path')
 
 // ---------- Env ----------
-const PORT  = process.env.PORT || 3000   // Render binds the port
+const PORT  = process.env.PORT || 3000   // Render binds this
 const MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime'
-
-// ---------- Pricing / hours (unused for 24/7, but keep loaded for future) ----------
-let PRICING = { timezone: 'America/Chicago' }
-let isOpenAt = () => true
-let quote = () => null
-try {
-  ({ config: PRICING, isOpenAt, quote } = require('./pricing'))
-  console.log('[BOOT] pricing.js loaded; timezone=', PRICING.timezone)
-} catch {
-  console.log('[BOOT] pricing.js not found; treating business as always OPEN')
-}
 
 // ---------- CSV (persist to /data if available) ----------
 const DATA_DIR = fs.existsSync('/data') ? '/data' : process.cwd()
@@ -41,14 +30,18 @@ function csvEscape(v) {
 }
 
 function appendLeadRow(obj) {
-  ensureCsvWithHeader()
-  const row = [
-    new Date().toISOString(),
-    obj.name, obj.phone, obj.year, obj.make, obj.model, obj.service, obj.zip,
-    obj.raw ?? obj.recordingUrl ?? ''
-  ].map(csvEscape).join(',') + '\n'
-  fs.appendFileSync(CSV_PATH, row)
-  console.log('[CSV] wrote lead/voicemail row')
+  try {
+    ensureCsvWithHeader()
+    const row = [
+      new Date().toISOString(),
+      obj.name ?? '', obj.phone ?? '', obj.year ?? '', obj.make ?? '', obj.model ?? '', obj.service ?? '', obj.zip ?? '',
+      obj.raw ?? obj.recordingUrl ?? ''
+    ].map(csvEscape).join(',') + '\n'
+    fs.appendFileSync(CSV_PATH, row)
+    console.log('[CSV] wrote lead/voicemail row')
+  } catch (e) {
+    console.error('[CSV] write error', e)
+  }
 }
 
 /** Parse "LEAD: Name=...; Phone=...; YMM=YYYY Make Model; Service=...; ZIP=..." */
@@ -80,34 +73,24 @@ app.use((req, _res, next) => { console.log(`[HTTP] ${req.method} ${req.url}`); n
 // Health
 app.get('/', (_req, res) => res.send('OK'))
 
-// Helpful GET so the browser doesn’t show “Cannot GET /voice”
+// Helpful GET (so browser GET /voice doesn’t look broken)
 app.get('/voice', (_req, res) => {
-  res.type('text/plain').send('Twilio should POST to /voice. GET is only for sanity checks.')
+  res
+    .status(200)
+    .type('text/plain')
+    .send('Twilio should POST to /voice. GET is only for sanity checks.')
 })
 
-// Dev helpers (kept)
+// Dev helpers
 app.get('/dev/lead', (_req, res) => {
   const sample = 'LEAD: Name=Test Caller; Phone=605-555-1212; YMM=2018 Honda Civic; Service=Lockout; ZIP=57106'
   appendLeadRow(parseLeadLine(sample))
   res.send('Sample lead appended to leads.csv')
 })
-app.get('/dev/open', (_req, res) => res.json({ openNow: true, timezone: PRICING.timezone })) // always open
-app.get('/dev/quote', (req, res) => {
-  const q = quote ? quote({
-    service: (req.query.service||'').trim(),
-    miles: Number(req.query.miles||0),
-    afterHours: String(req.query.afterHours||'').toLowerCase()==='true',
-    euro: String(req.query.euro||'').toLowerCase()==='true',
-    laserCut: String(req.query.laserCut||'').toLowerCase()==='true',
-  }) : null
-  if (!q) return res.status(400).json({ error: 'Unknown service or pricing not loaded' })
-  res.json({ range: q })
-})
 
-// ---------- Voice webhook (Twilio -> here) 24/7 ----------
+// Voice webhook (Twilio -> here) — 24/7 assistant (no hours gating)
 app.post('/voice', (req, res) => {
-  console.log('[VOICE] hit /voice; forcing OPEN=TRUE (24/7)')
-  // Always connect the bidirectional media stream
+  console.log('[VOICE] hit /voice (24/7 mode)')
   res.type('text/xml').send(`
     <Response>
       <Say voice="alice">Connecting you to our assistant now.</Say>
@@ -116,7 +99,7 @@ app.post('/voice', (req, res) => {
   `)
 })
 
-// Voicemail (kept for future use)
+// Voicemail (Twilio posts form-encoded here after <Record>) — will be used only if you wire it in Twilio
 app.post('/voicemail', (req, res) => {
   try {
     const from = req.body?.From || 'unknown'
@@ -128,27 +111,26 @@ app.post('/voicemail', (req, res) => {
   res.type('text/xml').send('<Response><Say voice="alice">Thank you. Goodbye.</Say></Response>')
 })
 
-// ---------- Start HTTP ----------
+// Start HTTP
 const server = app.listen(PORT, () => console.log(`[BOOT] HTTP up on :${PORT}`))
-
-// Log WebSocket upgrade attempts (helpful for diagnosing WS issues)
-server.on('upgrade', (req, _socket, _head) => {
-  console.log('[UPGRADE] request', req.url, 'ua=', req.headers['user-agent'])
-})
 
 // ---------- WebSocket bridge (Twilio <-> OpenAI) ----------
 const wss = new WebSocketServer({ server, path: '/media' })
 
-wss.on('connection', (twilioWS) => {
-  console.log('[WSS] Twilio connected to /media')
+wss.on('connection', (twilioWS, req) => {
+  console.log('[WSS] Twilio connected to /media from', req.socket.remoteAddress)
   let streamSid = null
   let lastLeadLine = ''
 
   // Connect to OpenAI Realtime
-  const openaiWS = new WebSocket(
-    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(MODEL)}`,
-    { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' } }
-  )
+  const oaUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(MODEL)}`
+  console.log('[OA] connecting to', oaUrl)
+  const openaiWS = new WebSocket(oaUrl, {
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      'OpenAI-Beta': 'realtime=v1'
+    }
+  })
 
   openaiWS.on('open', () => {
     console.log('[OA] connected')
@@ -166,7 +148,7 @@ wss.on('connection', (twilioWS) => {
     }))
   })
 
-  // From OpenAI -> to caller; capture LEAD line from text stream
+  // From OpenAI -> to caller
   openaiWS.on('message', (data) => {
     try {
       const msg = JSON.parse(data.toString())
@@ -194,7 +176,9 @@ wss.on('connection', (twilioWS) => {
     if (msg.event === 'start') {
       streamSid = msg.start.streamSid
       console.log('[WSS] stream start', streamSid)
-      if (openaiWS.readyState === WebSocket.OPEN) openaiWS.send(JSON.stringify({ type: 'response.create' }))
+      if (openaiWS.readyState === WebSocket.OPEN) {
+        openaiWS.send(JSON.stringify({ type: 'response.create' }))
+      }
     }
 
     if (msg.event === 'media' && msg.media?.payload) {
