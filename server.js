@@ -1,17 +1,18 @@
 // server.js — Twilio <-> OpenAI Realtime bridge (multi-tenant ready)
 //
 // Features:
-//  - Structured lead capture (CSV)
-//  - Business-hours check (from pricing.json)
-//  - Closed-hours voicemail (stores RecordingUrl in CSV)
+//  - Structured lead capture (CSV) to persistent disk (/data on Render)
+//  - Business-hours check (from pricing.json) to set after-hours behavior
 //  - Dev endpoints: /dev/lead, /dev/open, /dev/quote
 //  - WebSocket bridge for <Connect><Stream> to GPT Realtime
 //  - Admin route: /admin/add-business
 //
-// Requirements:
-//  - .env with OPENAI_API_KEY, PORT=3001 (optional), OPENAI_REALTIME_MODEL=gpt-4o-realtime, ADMIN_TOKEN
-//  - pricing.json and pricing.js present
-//  - Prisma with sqlite (dev.db)
+// Env:
+//  - OPENAI_API_KEY (required)
+//  - OPENAI_REALTIME_MODEL (default: gpt-4o-realtime)
+//  - PORT (default: 3001)
+//  - ADMIN_TOKEN (for /admin/add-business)
+//  - LEADS_PATH (default: /data/leads.csv on Render; local fallback ok)
 
 require('dotenv').config()
 const express = require('express')
@@ -27,15 +28,21 @@ const MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime'
 const { config: PRICING, quote, isOpenAt } = require('./pricing')
 
 // ===== CSV helpers (structured leads) =====
-const CSV_PATH = path.join(process.cwd(), 'leads.csv')
+const CSV_PATH = process.env.LEADS_PATH || '/data/leads.csv'
 
 function ensureCsvWithHeader() {
-  if (!fs.existsSync(CSV_PATH)) {
-    fs.writeFileSync(
-      CSV_PATH,
-      'timestamp,name,phone,year,make,model,service,zip,raw\n',
-      'utf8'
-    )
+  try {
+    const dir = path.dirname(CSV_PATH)
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+    if (!fs.existsSync(CSV_PATH)) {
+      fs.writeFileSync(
+        CSV_PATH,
+        'timestamp,name,phone,year,make,model,service,zip,raw\n',
+        'utf8'
+      )
+    }
+  } catch (e) {
+    console.error('ensureCsvWithHeader error:', e)
   }
 }
 
@@ -45,6 +52,7 @@ function csvEscape(v) {
   return s
 }
 
+// Parse: LEAD: Name=John; Phone=605-555-1212; YMM=2018 Honda Civic; Service=Lockout; ZIP=57106
 function parseLeadLine(leadLine) {
   const raw = (leadLine || '').trim()
   const m = raw.match(/Name\s*=\s*([^;]+).*?Phone\s*=\s*([^;]+).*?YMM\s*=\s*([^;]+).*?Service\s*=\s*([^;]+).*?ZIP\s*=\s*([^;]+)/i)
@@ -68,17 +76,22 @@ function parseLeadLine(leadLine) {
 }
 
 function appendLeadRow(lead) {
-  ensureCsvWithHeader()
-  const row = [
-    new Date().toISOString(),
-    lead.name, lead.phone, lead.year, lead.make, lead.model, lead.service, lead.zip, lead.raw
-  ].map(csvEscape).join(',') + '\n'
-  fs.appendFileSync(CSV_PATH, row)
+  try {
+    ensureCsvWithHeader()
+    const row = [
+      new Date().toISOString(),
+      lead.name, lead.phone, lead.year, lead.make, lead.model, lead.service, lead.zip, lead.raw
+    ].map(csvEscape).join(',') + '\n'
+    fs.appendFileSync(CSV_PATH, row)
+  } catch (e) {
+    console.error('appendLeadRow error:', e)
+  }
 }
 
 // ===== App =====
 const app = express()
-app.use(express.json()) // needed for /admin/add-business
+app.use(express.json())
+app.use(express.urlencoded({ extended: false })) // Twilio posts form-encoded
 
 // Health check
 app.get('/', (_req, res) => res.send('OK'))
@@ -87,7 +100,7 @@ app.get('/', (_req, res) => res.send('OK'))
 app.get('/dev/lead', (_req, res) => {
   const sample = 'LEAD: Name=Test Caller; Phone=605-555-1212; YMM=2018 Honda Civic; Service=Lockout; ZIP=57106'
   appendLeadRow(parseLeadLine(sample))
-  res.send('Sample lead written to leads.csv with structured columns.')
+  res.send(`Sample lead written to ${CSV_PATH} with structured columns.`)
 })
 
 // ----- Dev: Is business open now? -----
@@ -107,34 +120,30 @@ app.get('/dev/quote', (req, res) => {
   res.json({ service, miles, afterHours, euro, laserCut, range: q })
 })
 
-// ----- Voice webhook -----
-app.post('/voice', (req, res) => {
-  const openNow = isOpenAt(new Date())
-  if (!openNow) {
-    res.type('text/xml').send(`
-      <Response>
-        <Say voice="alice">
-          Thank you for calling Cars and Keys. Our office is currently closed.
-          Please leave your name, phone number, the year, make and model of your vehicle,
-          and the service you need. We will get back to you as soon as possible during business hours.
-          Goodbye.
-        </Say>
-        <Record maxLength="90" action="/voicemail" />
-        <Hangup/>
-      </Response>
-    `)
-  } else {
-    res.type('text/xml').send(`
-      <Response>
-        <Say voice="alice">Thanks for calling Cars and Keys. Connecting you to our assistant.</Say>
-        <Connect><Stream url="wss://${req.hostname}/media" /></Connect>
-      </Response>
-    `)
-  }
+// ----- Voice webhook (ALWAYS connect; Sofia adjusts tone after-hours) -----
+function voiceTwiML(hostname) {
+  return `
+    <Response>
+      <Say voice="alice">Connecting you to our assistant now.</Say>
+      <Connect><Stream url="wss://${hostname}/media" /></Connect>
+    </Response>
+  `
+}
+
+// For browser sanity checks:
+app.get('/voice', (req, res) => {
+  console.log('[/voice GET] hit', new Date().toISOString())
+  res.type('text/xml').send(voiceTwiML(req.get('host')))
 })
 
-// ----- Voicemail handler -----
-app.post('/voicemail', express.urlencoded({ extended: false }), (req, res) => {
+// Twilio real webhook:
+app.post('/voice', (req, res) => {
+  console.log('[/voice POST] hit', new Date().toISOString())
+  res.type('text/xml').send(voiceTwiML(req.get('host')))
+})
+
+// ----- Voicemail handler (kept as fallback; not used in normal flow) -----
+app.post('/voicemail', (req, res) => {
   try {
     const ts = new Date().toISOString()
     const from = req.body.From || 'unknown'
@@ -181,7 +190,7 @@ app.post('/admin/add-business', async (req, res) => {
       },
       scripts: {
         greeting:  'Thanks for calling {{businessName}}. Connecting you to our assistant.',
-        voicemail: 'Thank you for calling {{businessName}}. We are currently closed. Please leave your name, phone number, the year, make and model of your vehicle, and the service you need. We will get back to you as soon as possible during business hours. Goodbye.'
+        voicemail: 'Thank you for calling {{businessName}}. We are currently closed. Please leave your details after the tone.'
       }
     }
 
@@ -218,9 +227,15 @@ wss.on('connection', (twilioWS) => {
   let streamSid = null
   let lastLeadLine = ''
 
+  // Connect to OpenAI Realtime
   const openaiWS = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(MODEL)}`,
-    { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' } }
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        'OpenAI-Beta': 'realtime=v1'
+      }
+    }
   )
 
   function toTwilio(base64ULaw) {
@@ -230,27 +245,56 @@ wss.on('connection', (twilioWS) => {
 
   openaiWS.on('open', () => {
     console.log('OpenAI connected.')
-    const instructions =
+
+    // Determine after-hours now (based on pricing hours)
+    let afterHours = false
+    try { afterHours = !isOpenAt(new Date()) } catch { afterHours = false }
+
+    const baseScript =
       "You are Sofia, the trusted phone assistant for Cars & Keys. " +
-      "When asked about pricing, give a safe range based on: business hours vs after-hours, travel distance beyond included miles, and any surcharges (laser-cut, European immobilizer). " +
-      "Be clear that quotes are ranges until VIN/immobilizer check. " +
       "Always collect: (1) year, make, model; (2) service (lockout/duplicate/transponder/all keys lost/programming); " +
-      "(3) ZIP/location; (4) best callback number. Confirm by repeating the number. " +
-      "At the END, output ONE line starting with EXACTLY 'LEAD:' in this format: LEAD: Name=<name>; Phone=<digits or formatted>; YMM=<year make model>; Service=<service>; ZIP=<zip>. " +
-      "Do not add any other text on that final line.";
+      "(3) ZIP/location; (4) best callback number (repeat the number back). " +
+      "When quoting, provide a safe range and note it’s approximate until VIN/immobilizer check. " +
+      "At the END, output ONE line starting with EXACTLY 'LEAD:' in this format: " +
+      "'LEAD: Name=<name>; Phone=<digits or formatted>; YMM=<year make model>; Service=<service>; ZIP=<zip>' " +
+      "Do not add any other text on that final line."
+
+    const afterHoursAddendum =
+      " You are speaking after business hours. Start by briefly noting the time and that you can take details now, " +
+      "and a technician will follow up as soon as business hours resume. If asked about price, include the after-hours surcharge in ranges. " +
+      "Avoid promising exact arrival times; offer a callback window instead."
+
+    const instructions = afterHours ? (baseScript + afterHoursAddendum) : baseScript
+
     openaiWS.send(JSON.stringify({
       type: 'session.update',
-      session: { input_audio_format: { type: 'g711_ulaw', sample_rate: 8000 }, output_audio_format: { type: 'g711_ulaw', sample_rate: 8000 }, instructions }
+      session: {
+        input_audio_format:  { type: 'g711_ulaw', sample_rate: 8000 },
+        output_audio_format: { type: 'g711_ulaw', sample_rate: 8000 },
+        instructions,
+        metadata: { afterHours }
+      }
     }))
+
+    // Greet immediately
+    openaiWS.send(JSON.stringify({ type: 'response.create' }))
   })
 
+  // Audio + text events from OpenAI
   openaiWS.on('message', (data) => {
     try {
       const msg = JSON.parse(data.toString())
-      if (msg.type === 'response.output_audio.delta' && msg.audio?.data) toTwilio(msg.audio.data)
+
+      if (msg.type === 'response.output_audio.delta' && msg.audio?.data) {
+        toTwilio(msg.audio.data)
+      }
+
       if (msg.type === 'response.output_text.delta' && typeof msg.delta === 'string') {
         const lines = msg.delta.split(/\r?\n/)
-        for (const line of lines) if (line.trim().toUpperCase().startsWith('LEAD:')) lastLeadLine = line.trim()
+        for (const line of lines) {
+          const t = line.trim()
+          if (t.toUpperCase().startsWith('LEAD:')) lastLeadLine = t
+        }
       }
     } catch (e) { console.error('OpenAI msg parse error', e) }
   })
@@ -258,13 +302,18 @@ wss.on('connection', (twilioWS) => {
   openaiWS.on('close', () => console.log('OpenAI closed'))
   openaiWS.on('error', (e) => console.error('OpenAI error', e))
 
+  // Caller audio from Twilio -> OpenAI
   twilioWS.on('message', (raw) => {
     const msg = JSON.parse(raw.toString())
+
     if (msg.event === 'start') {
       streamSid = msg.start.streamSid
       console.log('Twilio stream started:', streamSid)
-      if (openaiWS.readyState === WebSocket.OPEN) openaiWS.send(JSON.stringify({ type: 'response.create' }))
+      if (openaiWS.readyState === WebSocket.OPEN) {
+        openaiWS.send(JSON.stringify({ type: 'response.create' }))
+      }
     }
+
     if (msg.event === 'media' && msg.media?.payload) {
       if (openaiWS.readyState === WebSocket.OPEN) {
         openaiWS.send(JSON.stringify({
@@ -273,6 +322,7 @@ wss.on('connection', (twilioWS) => {
         }))
       }
     }
+
     if (msg.event === 'stop') {
       if (openaiWS.readyState === WebSocket.OPEN) {
         openaiWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }))
@@ -282,11 +332,16 @@ wss.on('connection', (twilioWS) => {
   })
 
   function writeLeadIfPresent() {
+    if (!lastLeadLine) return
     const parsed = parseLeadLine(lastLeadLine || 'LEAD:')
     appendLeadRow(parsed)
     console.log('Lead saved:', parsed)
   }
 
-  twilioWS.on('close', () => { console.log('Twilio closed'); if (openaiWS.readyState === WebSocket.OPEN) openaiWS.close(); writeLeadIfPresent() })
+  twilioWS.on('close', () => {
+    console.log('Twilio closed')
+    if (openaiWS.readyState === WebSocket.OPEN) openaiWS.close()
+    writeLeadIfPresent()
+  })
   twilioWS.on('error', (e) => console.error('Twilio WS error', e))
 })
