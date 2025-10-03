@@ -101,7 +101,7 @@ app.get('/dev/quote', (req, res) => {
 
 // Voice webhook (Twilio -> here)
 app.post('/voice', (req, res) => {
-  const openNow = isOpenAt(new Date())
+  const openNow = true (new Date())
   console.log('[VOICE] hit /voice; openNow=', openNow)
 
   if (!openNow) {
