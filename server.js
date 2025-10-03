@@ -1,4 +1,4 @@
-// server.js — Twilio <-> OpenAI Realtime voice bridge (24/7 connect, CSV + dev tools)
+// server.js — Twilio <-> OpenAI Realtime voice bridge (full, debug-friendly, CSV + 24/7)
 require('dotenv').config()
 const express = require('express')
 const { WebSocketServer, WebSocket } = require('ws')
@@ -6,10 +6,10 @@ const fs = require('fs')
 const path = require('path')
 
 // ---------- Env ----------
-const PORT  = process.env.PORT || 3000   // Render provides PORT
+const PORT  = process.env.PORT || 3000   // Render binds the port
 const MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime'
 
-// ---------- Pricing / hours (optional; not used for routing now) ----------
+// ---------- Pricing / hours (unused for 24/7, but keep loaded for future) ----------
 let PRICING = { timezone: 'America/Chicago' }
 let isOpenAt = () => true
 let quote = () => null
@@ -17,11 +17,11 @@ try {
   ({ config: PRICING, isOpenAt, quote } = require('./pricing'))
   console.log('[BOOT] pricing.js loaded; timezone=', PRICING.timezone)
 } catch {
-  console.log('[BOOT] pricing.js not found; continuing without it')
+  console.log('[BOOT] pricing.js not found; treating business as always OPEN')
 }
 
 // ---------- CSV (persist to /data if available) ----------
-const DATA_DIR = fs.existsync?.('/data') ? '/data' : fs.existsSync('/data') ? '/data' : process.cwd()
+const DATA_DIR = fs.existsSync('/data') ? '/data' : process.cwd()
 const CSV_PATH = path.join(DATA_DIR, 'leads.csv')
 
 function ensureCsvWithHeader() {
@@ -80,13 +80,18 @@ app.use((req, _res, next) => { console.log(`[HTTP] ${req.method} ${req.url}`); n
 // Health
 app.get('/', (_req, res) => res.send('OK'))
 
-// Dev helpers
+// Helpful GET so the browser doesn’t show “Cannot GET /voice”
+app.get('/voice', (_req, res) => {
+  res.type('text/plain').send('Twilio should POST to /voice. GET is only for sanity checks.')
+})
+
+// Dev helpers (kept)
 app.get('/dev/lead', (_req, res) => {
   const sample = 'LEAD: Name=Test Caller; Phone=605-555-1212; YMM=2018 Honda Civic; Service=Lockout; ZIP=57106'
   appendLeadRow(parseLeadLine(sample))
   res.send('Sample lead appended to leads.csv')
 })
-app.get('/dev/open', (_req, res) => res.json({ openNow: isOpenAt(new Date()), timezone: PRICING.timezone }))
+app.get('/dev/open', (_req, res) => res.json({ openNow: true, timezone: PRICING.timezone })) // always open
 app.get('/dev/quote', (req, res) => {
   const q = quote ? quote({
     service: (req.query.service||'').trim(),
@@ -99,11 +104,10 @@ app.get('/dev/quote', (req, res) => {
   res.json({ range: q })
 })
 
-/* =========================
-   24/7 Voice Webhook (no hours)
-   ========================= */
+// ---------- Voice webhook (Twilio -> here) 24/7 ----------
 app.post('/voice', (req, res) => {
-  console.log('[VOICE] hit /voice; always connecting (24/7)')
+  console.log('[VOICE] hit /voice; forcing OPEN=TRUE (24/7)')
+  // Always connect the bidirectional media stream
   res.type('text/xml').send(`
     <Response>
       <Say voice="alice">Connecting you to our assistant now.</Say>
@@ -112,7 +116,7 @@ app.post('/voice', (req, res) => {
   `)
 })
 
-// Voicemail endpoint left in place (not used by /voice now, but safe to keep)
+// Voicemail (kept for future use)
 app.post('/voicemail', (req, res) => {
   try {
     const from = req.body?.From || 'unknown'
@@ -124,45 +128,13 @@ app.post('/voicemail', (req, res) => {
   res.type('text/xml').send('<Response><Say voice="alice">Thank you. Goodbye.</Say></Response>')
 })
 
-// Optional admin route (requires Prisma & ADMIN_TOKEN)
-if (process.env.ADMIN_TOKEN) {
-  app.post('/admin/add-business', async (req, res) => {
-    if ((req.headers['x-admin-token'] || req.query.token) !== process.env.ADMIN_TOKEN) {
-      return res.status(401).json({ error: 'unauthorized' })
-    }
-    try {
-      const { PrismaClient } = require('@prisma/client')
-      const prisma = new PrismaClient()
-      const { name, e164, timezone='America/Chicago' } = req.body || {}
-      if (!name || !e164) return res.status(400).json({ error: 'name and e164 required' })
-
-      const defaultProfile = {
-        hours: {
-          mon:['08:00-22:00'], tue:['08:00-22:00'], wed:['08:00-22:00'],
-          thu:['08:00-22:00'], fri:['08:00-22:00'], sat:['09:00-20:00'], sun:['10:00-18:00']
-        }
-      }
-
-      let biz = await prisma.business.findFirst({ where: { name } })
-      biz = biz
-        ? await prisma.business.update({ where: { id: biz.id }, data: { name, timezone, profile: defaultProfile } })
-        : await prisma.business.create({ data: { name, timezone, profile: defaultProfile } })
-
-      const existing = await prisma.phoneNumber.findUnique({ where: { e164 } })
-      if (existing) await prisma.phoneNumber.update({ where: { e164 }, data: { businessId: biz.id } })
-      else await prisma.phoneNumber.create({ data: { e164, businessId: biz.id } })
-
-      await prisma.$disconnect()
-      res.json({ ok: true, businessId: biz.id })
-    } catch (e) {
-      console.error('[ADMIN] prisma unavailable or error', e)
-      res.status(501).json({ error: 'prisma_not_available' })
-    }
-  })
-}
-
-// Start HTTP
+// ---------- Start HTTP ----------
 const server = app.listen(PORT, () => console.log(`[BOOT] HTTP up on :${PORT}`))
+
+// Log WebSocket upgrade attempts (helpful for diagnosing WS issues)
+server.on('upgrade', (req, _socket, _head) => {
+  console.log('[UPGRADE] request', req.url, 'ua=', req.headers['user-agent'])
+})
 
 // ---------- WebSocket bridge (Twilio <-> OpenAI) ----------
 const wss = new WebSocketServer({ server, path: '/media' })
@@ -194,7 +166,7 @@ wss.on('connection', (twilioWS) => {
     }))
   })
 
-  // From OpenAI -> to caller
+  // From OpenAI -> to caller; capture LEAD line from text stream
   openaiWS.on('message', (data) => {
     try {
       const msg = JSON.parse(data.toString())
