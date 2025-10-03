@@ -1,4 +1,4 @@
-// server.js — Twilio <-> OpenAI Realtime voice bridge (full, debug-friendly, CSV + hours + voicemail)
+// server.js — Twilio <-> OpenAI Realtime voice bridge (24/7 connect, CSV + dev tools)
 require('dotenv').config()
 const express = require('express')
 const { WebSocketServer, WebSocket } = require('ws')
@@ -6,10 +6,10 @@ const fs = require('fs')
 const path = require('path')
 
 // ---------- Env ----------
-const PORT  = process.env.PORT || 3000   // <- bind to Render's provided port
+const PORT  = process.env.PORT || 3000   // Render provides PORT
 const MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime'
 
-// ---------- Pricing / hours (optional) ----------
+// ---------- Pricing / hours (optional; not used for routing now) ----------
 let PRICING = { timezone: 'America/Chicago' }
 let isOpenAt = () => true
 let quote = () => null
@@ -17,11 +17,11 @@ try {
   ({ config: PRICING, isOpenAt, quote } = require('./pricing'))
   console.log('[BOOT] pricing.js loaded; timezone=', PRICING.timezone)
 } catch {
-  console.log('[BOOT] pricing.js not found; treating business as always OPEN')
+  console.log('[BOOT] pricing.js not found; continuing without it')
 }
 
 // ---------- CSV (persist to /data if available) ----------
-const DATA_DIR = fs.existsSync('/data') ? '/data' : process.cwd()
+const DATA_DIR = fs.existsync?.('/data') ? '/data' : fs.existsSync('/data') ? '/data' : process.cwd()
 const CSV_PATH = path.join(DATA_DIR, 'leads.csv')
 
 function ensureCsvWithHeader() {
@@ -99,29 +99,11 @@ app.get('/dev/quote', (req, res) => {
   res.json({ range: q })
 })
 
-// Voice webhook (Twilio -> here)
+/* =========================
+   24/7 Voice Webhook (no hours)
+   ========================= */
 app.post('/voice', (req, res) => {
-  const openNow = true (new Date())
-  console.log('[VOICE] hit /voice; openNow=', openNow)
-
-  if (!openNow) {
-    // After-hours: route to voicemail
-    res.type('text/xml').send(`
-      <Response>
-        <Say voice="alice">
-          Thank you for calling Cars and Keys. Our office is currently closed.
-          Please leave your name, phone number, the year, make and model of your vehicle,
-          and the service you need. We will get back to you as soon as possible during business hours.
-          Goodbye.
-        </Say>
-        <Record maxLength="90" action="/voicemail" />
-        <Hangup/>
-      </Response>
-    `)
-    return
-  }
-
-  // Open: connect the bidirectional media stream
+  console.log('[VOICE] hit /voice; always connecting (24/7)')
   res.type('text/xml').send(`
     <Response>
       <Say voice="alice">Connecting you to our assistant now.</Say>
@@ -130,7 +112,7 @@ app.post('/voice', (req, res) => {
   `)
 })
 
-// Voicemail (Twilio posts form-encoded here after <Record>)
+// Voicemail endpoint left in place (not used by /voice now, but safe to keep)
 app.post('/voicemail', (req, res) => {
   try {
     const from = req.body?.From || 'unknown'
