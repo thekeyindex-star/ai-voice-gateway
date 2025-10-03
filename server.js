@@ -6,7 +6,7 @@ const fs = require('fs')
 const path = require('path')
 
 // ---------- Env ----------
-const PORT  = process.env.PORT || 3001
+const PORT  = process.env.PORT || 3000   // <- bind to Render's provided port
 const MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime'
 
 // ---------- Pricing / hours (optional) ----------
@@ -258,7 +258,6 @@ wss.on('connection', (twilioWS) => {
         openaiWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }))
         openaiWS.send(JSON.stringify({ type: 'response.create' }))
       }
-      // Persist any captured LEAD
       if (lastLeadLine) {
         appendLeadRow(parseLeadLine(lastLeadLine))
         lastLeadLine = ''
