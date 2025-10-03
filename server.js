@@ -1,231 +1,76 @@
-// server.js — Twilio <-> OpenAI Realtime bridge (multi-tenant ready)
-//
-// Features:
-//  - Structured lead capture (CSV) to persistent disk (/data on Render)
-//  - Business-hours check (from pricing.json) to set after-hours behavior
-//  - Dev endpoints: /dev/lead, /dev/open, /dev/quote
-//  - WebSocket bridge for <Connect><Stream> to GPT Realtime
-//  - Admin route: /admin/add-business
-//
-// Env:
-//  - OPENAI_API_KEY (required)
-//  - OPENAI_REALTIME_MODEL (default: gpt-4o-realtime)
-//  - PORT (default: 3001)
-//  - ADMIN_TOKEN (for /admin/add-business)
-//  - LEADS_PATH (default: /data/leads.csv on Render; local fallback ok)
+// server.js — COMPLETE debug bridge for Twilio <-> OpenAI Realtime
+// Goal: fix call hang-ups by adding Stream status logs + robust WS handling.
 
-require('dotenv').config()
-const express = require('express')
-const { WebSocketServer, WebSocket } = require('ws')
-const fs = require('fs')
-const path = require('path')
+require('dotenv').config();
+const express = require('express');
+const { WebSocketServer, WebSocket } = require('ws');
 
-// ===== Env / Ports / Model =====
-const PORT  = process.env.PORT || 3001
-const MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime'
-
-// ===== Pricing engine (hours + quotes) =====
-const { config: PRICING, quote, isOpenAt } = require('./pricing')
-
-// ===== CSV helpers (structured leads) =====
-const CSV_PATH = process.env.LEADS_PATH || '/data/leads.csv'
-
-function ensureCsvWithHeader() {
-  try {
-    const dir = path.dirname(CSV_PATH)
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
-    if (!fs.existsSync(CSV_PATH)) {
-      fs.writeFileSync(
-        CSV_PATH,
-        'timestamp,name,phone,year,make,model,service,zip,raw\n',
-        'utf8'
-      )
-    }
-  } catch (e) {
-    console.error('ensureCsvWithHeader error:', e)
-  }
+const PORT  = process.env.PORT || 3001;
+const MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime';
+if (!process.env.OPENAI_API_KEY) {
+  console.warn('[BOOT] Missing OPENAI_API_KEY in environment');
 }
 
-function csvEscape(v) {
-  const s = (v ?? '').toString()
-  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`
-  return s
-}
+const app = express();
+app.use(express.urlencoded({ extended: false })); // Twilio posts form-encoded
+app.use(express.json());
 
-// Parse: LEAD: Name=John; Phone=605-555-1212; YMM=2018 Honda Civic; Service=Lockout; ZIP=57106
-function parseLeadLine(leadLine) {
-  const raw = (leadLine || '').trim()
-  const m = raw.match(/Name\s*=\s*([^;]+).*?Phone\s*=\s*([^;]+).*?YMM\s*=\s*([^;]+).*?Service\s*=\s*([^;]+).*?ZIP\s*=\s*([^;]+)/i)
-  let name = '', phone = '', year = '', make = '', model = '', service = '', zip = ''
-  if (m) {
-    name = m[1].trim()
-    phone = m[2].trim()
-    const ymm = m[3].trim()
-    service = m[4].trim()
-    zip = m[5].trim()
-    const ym = ymm.match(/(\d{4})\s+([A-Za-z0-9-]+)\s+(.*)/)
-    if (ym) {
-      year = ym[1].trim()
-      make = ym[2].trim()
-      model = ym[3].trim()
-    } else {
-      model = ymm
-    }
-  }
-  return { name, phone, year, make, model, service, zip, raw }
-}
+// ---------- Health ----------
+app.get('/', (_req, res) => res.send('OK'));
 
-function appendLeadRow(lead) {
-  try {
-    ensureCsvWithHeader()
-    const row = [
-      new Date().toISOString(),
-      lead.name, lead.phone, lead.year, lead.make, lead.model, lead.service, lead.zip, lead.raw
-    ].map(csvEscape).join(',') + '\n'
-    fs.appendFileSync(CSV_PATH, row)
-  } catch (e) {
-    console.error('appendLeadRow error:', e)
-  }
-}
-
-// ===== App =====
-const app = express()
-app.use(express.json())
-app.use(express.urlencoded({ extended: false })) // Twilio posts form-encoded
-
-// Health check
-app.get('/', (_req, res) => res.send('OK'))
-
-// ----- Dev helper: write a sample structured LEAD row -----
-app.get('/dev/lead', (_req, res) => {
-  const sample = 'LEAD: Name=Test Caller; Phone=605-555-1212; YMM=2018 Honda Civic; Service=Lockout; ZIP=57106'
-  appendLeadRow(parseLeadLine(sample))
-  res.send(`Sample lead written to ${CSV_PATH} with structured columns.`)
-})
-
-// ----- Dev: Is business open now? -----
-app.get('/dev/open', (_req, res) => {
-  res.json({ openNow: isOpenAt(new Date()), timezone: PRICING.timezone })
-})
-
-// ----- Dev: Price a scenario -----
-app.get('/dev/quote', (req, res) => {
-  const service    = (req.query.service || '').trim()
-  const miles      = Number(req.query.miles || 0)
-  const afterHours = String(req.query.afterHours || '').toLowerCase() === 'true'
-  const euro       = String(req.query.euro || '').toLowerCase() === 'true'
-  const laserCut   = String(req.query.laserCut || '').toLowerCase() === 'true'
-  const q = quote({ service, miles, afterHours, euro, laserCut })
-  if (!q) return res.status(400).json({ error: 'Unknown service', services: Object.keys(PRICING.services) })
-  res.json({ service, miles, afterHours, euro, laserCut, range: q })
-})
-
-// ----- Voice webhook (ALWAYS connect; Sofia adjusts tone after-hours) -----
-function voiceTwiML(hostname) {
-  return `
-    <Response>
-      <Say voice="alice">Connecting you to our assistant now.</Say>
-      <Connect><Stream url="wss://${hostname}/media" /></Connect>
-    </Response>
-  `
-}
-
-// For browser sanity checks:
-app.get('/voice', (req, res) => {
-  console.log('[/voice GET] hit', new Date().toISOString())
-  res.type('text/xml').send(voiceTwiML(req.get('host')))
-})
-
-// Twilio real webhook:
+// ---------- Voice webhook (DEBUG: always go realtime) ----------
 app.post('/voice', (req, res) => {
-  console.log('[/voice POST] hit', new Date().toISOString())
-  res.type('text/xml').send(voiceTwiML(req.get('host')))
-})
-
-// ----- Voicemail handler (kept as fallback; not used in normal flow) -----
-app.post('/voicemail', (req, res) => {
-  try {
-    const ts = new Date().toISOString()
-    const from = req.body.From || 'unknown'
-    const recording = req.body.RecordingUrl || ''
-    const row = [ ts, '', from, '', '', '', 'voicemail', '', recording ].map(csvEscape).join(',') + '\n'
-    ensureCsvWithHeader()
-    fs.appendFileSync(CSV_PATH, row)
-    console.log('Voicemail saved:', { from, recording })
-  } catch (e) {
-    console.error('Voicemail save error:', e)
+  // If you want to flip to voicemail temporarily, set ?mode=vm on the Twilio URL.
+  if (String(req.query.mode || '').toLowerCase() === 'vm') {
+    return res.type('text/xml').send(`
+      <Response>
+        <Say voice="alice">
+          Thank you for calling Cars and Keys. We are currently unavailable.
+          Please leave your name, number, year make model, and service needed.
+        </Say>
+        <Record maxLength="90" /><Hangup/>
+      </Response>`);
   }
-  res.type('text/xml').send('<Response><Say voice="alice">Thank you. Goodbye.</Say></Response>')
-})
 
-// --- Admin route: add business (multi-tenant) ---
-app.post('/admin/add-business', async (req, res) => {
+  const twiml = `
+    <Response>
+      <Say voice="alice">Thanks for calling Cars and Keys. Connecting you to our assistant.</Say>
+      <Connect>
+        <Stream
+          url="wss://${req.hostname}/media"
+          statusCallback="/stream-status"
+          statusCallbackEvent="start connected error disconnected end"
+        />
+      </Connect>
+    </Response>
+  `;
+  res.type('text/xml').send(twiml);
+});
+
+// ---------- Stream lifecycle logs ----------
+app.post('/stream-status', (req, res) => {
   try {
-    const token = req.headers['x-admin-token'] || req.query.token
-    if (!process.env.ADMIN_TOKEN || token !== process.env.ADMIN_TOKEN) {
-      return res.status(401).json({ error: 'unauthorized' })
-    }
-
-    const { PrismaClient } = require('@prisma/client')
-    const prisma = new PrismaClient()
-    const { name, e164, timezone = 'America/Chicago' } = req.body || {}
-
-    if (!name || !e164) return res.status(400).json({ error: 'name and e164 required' })
-
-    const defaultProfile = {
-      hours: {
-        mon: ['08:00-22:00'], tue: ['08:00-22:00'], wed: ['08:00-22:00'],
-        thu: ['08:00-22:00'], fri: ['08:00-22:00'], sat: ['09:00-20:00'], sun: ['10:00-18:00']
-      },
-      pricing: {
-        afterHoursSurcharge: 40,
-        travel: { includedMiles: 10, perMileAfter: 2.0, oneWay: true },
-        services: {
-          lockout:               { day: [79,119],  night: [119,159] },
-          duplicate_basic:       { day: [59,89],   night: [89,119] },
-          duplicate_transponder: { day: [129,179], night: [169,219] },
-          all_keys_lost:         { day: [199,349], night: [249,399] },
-          fob_programming:       { day: [99,149],  night: [139,189] }
-        }
-      },
-      scripts: {
-        greeting:  'Thanks for calling {{businessName}}. Connecting you to our assistant.',
-        voicemail: 'Thank you for calling {{businessName}}. We are currently closed. Please leave your details after the tone.'
-      }
-    }
-
-    let biz = await prisma.business.findFirst({ where: { name } })
-    if (biz) {
-      biz = await prisma.business.update({ where: { id: biz.id }, data: { name, timezone, profile: defaultProfile } })
-    } else {
-      biz = await prisma.business.create({ data: { name, timezone, profile: defaultProfile } })
-    }
-
-    const existing = await prisma.phoneNumber.findUnique({ where: { e164 } })
-    if (existing) {
-      await prisma.phoneNumber.update({ where: { e164 }, data: { businessId: biz.id } })
-    } else {
-      await prisma.phoneNumber.create({ data: { e164, businessId: biz.id } })
-    }
-
-    await prisma.$disconnect()
-    res.json({ ok: true, businessId: biz.id })
+    // Twilio posts many fields like EventType, StreamSid, Start, etc.
+    console.log('[STATUS]', req.body);
   } catch (e) {
-    console.error(e)
-    res.status(500).json({ error: 'server_error' })
+    console.error('[STATUS] parse error', e);
   }
-})
+  res.sendStatus(200);
+});
 
-// Start HTTP
-const server = app.listen(PORT, () => console.log(`HTTP up on :${PORT}`))
+// ---------- Start HTTP ----------
+const server = app.listen(PORT, () => {
+  console.log(`[BOOT] HTTP up on :${PORT}`);
+});
 
-// ===== WebSocket bridge =====
-const wss = new WebSocketServer({ server, path: '/media' })
+// ---------- WebSocket bridge (Twilio <-> OpenAI) ----------
+const wss = new WebSocketServer({ server, path: '/media' });
 
-wss.on('connection', (twilioWS) => {
-  console.log('Twilio connected.')
-  let streamSid = null
-  let lastLeadLine = ''
+wss.on('connection', (twilioWS, req) => {
+  console.log('[WSS] Twilio connected from', req.socket?.remoteAddress);
+  let streamSid = null;
+  let frames = 0;
+  let closed = false;
 
   // Connect to OpenAI Realtime
   const openaiWS = new WebSocket(
@@ -236,112 +81,110 @@ wss.on('connection', (twilioWS) => {
         'OpenAI-Beta': 'realtime=v1'
       }
     }
-  )
+  );
 
-  function toTwilio(base64ULaw) {
-    if (!streamSid || twilioWS.readyState !== WebSocket.OPEN) return
-    twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload: base64ULaw } }))
+  // Keepalives help avoid idle timeouts on some hosts
+  const pingInterval = setInterval(() => {
+    try {
+      if (twilioWS.readyState === WebSocket.OPEN) twilioWS.ping();
+      if (openaiWS.readyState === WebSocket.OPEN) openaiWS.ping();
+    } catch {}
+  }, 15000);
+
+  function cleanup() {
+    if (closed) return;
+    closed = true;
+    clearInterval(pingInterval);
+    try { if (openaiWS.readyState === WebSocket.OPEN) openaiWS.close(); } catch {}
+    try { if (twilioWS.readyState === WebSocket.OPEN) twilioWS.close(); } catch {}
+    console.log('[WSS] cleaned up');
   }
 
+  function sendToTwilio(base64uLaw) {
+    if (!streamSid || twilioWS.readyState !== WebSocket.OPEN) return;
+    twilioWS.send(JSON.stringify({
+      event: 'media',
+      streamSid,
+      media: { payload: base64uLaw }
+    }));
+  }
+
+  // ----- OpenAI handlers -----
   openaiWS.on('open', () => {
-    console.log('OpenAI connected.')
-
-    // Determine after-hours now (based on pricing hours)
-    let afterHours = false
-    try { afterHours = !isOpenAt(new Date()) } catch { afterHours = false }
-
-    const baseScript =
-      "You are Sofia, the trusted phone assistant for Cars & Keys. " +
-      "Always collect: (1) year, make, model; (2) service (lockout/duplicate/transponder/all keys lost/programming); " +
-      "(3) ZIP/location; (4) best callback number (repeat the number back). " +
-      "When quoting, provide a safe range and note it’s approximate until VIN/immobilizer check. " +
-      "At the END, output ONE line starting with EXACTLY 'LEAD:' in this format: " +
-      "'LEAD: Name=<name>; Phone=<digits or formatted>; YMM=<year make model>; Service=<service>; ZIP=<zip>' " +
-      "Do not add any other text on that final line."
-
-    const afterHoursAddendum =
-      " You are speaking after business hours. Start by briefly noting the time and that you can take details now, " +
-      "and a technician will follow up as soon as business hours resume. If asked about price, include the after-hours surcharge in ranges. " +
-      "Avoid promising exact arrival times; offer a callback window instead."
-
-    const instructions = afterHours ? (baseScript + afterHoursAddendum) : baseScript
-
+    console.log('[OA] connected');
     openaiWS.send(JSON.stringify({
       type: 'session.update',
       session: {
+        // Match PSTN so we do zero transcoding:
         input_audio_format:  { type: 'g711_ulaw', sample_rate: 8000 },
         output_audio_format: { type: 'g711_ulaw', sample_rate: 8000 },
-        instructions,
-        metadata: { afterHours }
+        instructions:
+          "You are Sofia, the trusted phone assistant for Cars & Keys. " +
+          "Always collect: (1) year, make, model; (2) job type (lockout, duplicate, all keys lost, programming); " +
+          "(3) ZIP/location; (4) best callback number (confirm by repeating). " +
+          "Give price ranges only; mention after-hours and travel may change pricing. Keep sentences short."
       }
-    }))
+    }));
+  });
 
-    // Greet immediately
-    openaiWS.send(JSON.stringify({ type: 'response.create' }))
-  })
-
-  // Audio + text events from OpenAI
   openaiWS.on('message', (data) => {
     try {
-      const msg = JSON.parse(data.toString())
-
+      const msg = JSON.parse(data.toString());
       if (msg.type === 'response.output_audio.delta' && msg.audio?.data) {
-        toTwilio(msg.audio.data)
+        // Send µ-law audio chunk back to caller
+        sendToTwilio(msg.audio.data);
       }
+      if (msg.type === 'error') {
+        console.error('[OA] error payload:', msg);
+      }
+    } catch (e) {
+      console.error('[OA] message parse error', e);
+    }
+  });
 
-      if (msg.type === 'response.output_text.delta' && typeof msg.delta === 'string') {
-        const lines = msg.delta.split(/\r?\n/)
-        for (const line of lines) {
-          const t = line.trim()
-          if (t.toUpperCase().startsWith('LEAD:')) lastLeadLine = t
+  openaiWS.on('close', () => console.log('[OA] socket closed'));
+  openaiWS.on('error', (e) => console.error('[OA] socket error', e));
+
+  // ----- Twilio handlers -----
+  twilioWS.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+
+      if (msg.event === 'start') {
+        streamSid = msg.start.streamSid;
+        console.log('[WSS] start streamSid', streamSid);
+        if (openaiWS.readyState === WebSocket.OPEN) {
+          openaiWS.send(JSON.stringify({ type: 'response.create' })); // greet immediately
         }
       }
-    } catch (e) { console.error('OpenAI msg parse error', e) }
-  })
 
-  openaiWS.on('close', () => console.log('OpenAI closed'))
-  openaiWS.on('error', (e) => console.error('OpenAI error', e))
-
-  // Caller audio from Twilio -> OpenAI
-  twilioWS.on('message', (raw) => {
-    const msg = JSON.parse(raw.toString())
-
-    if (msg.event === 'start') {
-      streamSid = msg.start.streamSid
-      console.log('Twilio stream started:', streamSid)
-      if (openaiWS.readyState === WebSocket.OPEN) {
-        openaiWS.send(JSON.stringify({ type: 'response.create' }))
+      if (msg.event === 'media' && msg.media?.payload) {
+        frames++;
+        if (frames % 100 === 0) console.log('[WSS] media frames', frames);
+        if (openaiWS.readyState === WebSocket.OPEN) {
+          openaiWS.send(JSON.stringify({
+            type: 'input_audio_buffer.append',
+            audio: { data: msg.media.payload, format: { type: 'g711_ulaw', sample_rate: 8000 } }
+          }));
+        }
       }
-    }
 
-    if (msg.event === 'media' && msg.media?.payload) {
-      if (openaiWS.readyState === WebSocket.OPEN) {
-        openaiWS.send(JSON.stringify({
-          type: 'input_audio_buffer.append',
-          audio: { data: msg.media.payload, format: { type: 'g711_ulaw', sample_rate: 8000 } }
-        }))
+      if (msg.event === 'stop') {
+        console.log('[WSS] stop streamSid', streamSid);
+        if (openaiWS.readyState === WebSocket.OPEN) {
+          openaiWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+          openaiWS.send(JSON.stringify({ type: 'response.create' }));
+        }
       }
+    } catch (e) {
+      console.error('[WSS] Twilio msg parse error', e);
     }
+  });
 
-    if (msg.event === 'stop') {
-      if (openaiWS.readyState === WebSocket.OPEN) {
-        openaiWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }))
-        openaiWS.send(JSON.stringify({ type: 'response.create' }))
-      }
-    }
-  })
+  twilioWS.on('close', () => { console.log('[WSS] Twilio socket closed'); cleanup(); });
+  twilioWS.on('error', (e) => { console.error('[WSS] Twilio socket error', e); cleanup(); });
 
-  function writeLeadIfPresent() {
-    if (!lastLeadLine) return
-    const parsed = parseLeadLine(lastLeadLine || 'LEAD:')
-    appendLeadRow(parsed)
-    console.log('Lead saved:', parsed)
-  }
-
-  twilioWS.on('close', () => {
-    console.log('Twilio closed')
-    if (openaiWS.readyState === WebSocket.OPEN) openaiWS.close()
-    writeLeadIfPresent()
-  })
-  twilioWS.on('error', (e) => console.error('Twilio WS error', e))
-})
+  // Safety: if OpenAI dies, end Twilio side too
+  openaiWS.on('close', cleanup);
+  openaiWS.on('error', cleanup);
+});
