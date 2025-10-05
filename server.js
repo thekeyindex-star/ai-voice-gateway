@@ -1,135 +1,156 @@
-// server.js — Fastify + WS + health + stable batching
-require('dotenv').config()
-const Fastify = require('fastify')
-const fastifyWebsocket = require('@fastify/websocket')
-const { WebSocket } = require('ws')
+// server.js — Fastify + Twilio <-> OpenAI Realtime bridge (g711 μ-law)
+require('dotenv').config();
 
-const PORT  = process.env.PORT || 3000
-const MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime'
-const OPENAI = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(MODEL)}`
+const fastify = require('fastify')({ logger: false });
+const formbody = require('@fastify/formbody');
+const { WebSocketServer, WebSocket } = require('ws');
 
-const app = Fastify({ logger: false })
-app.register(fastifyWebsocket)
+const PORT  = process.env.PORT || 3001;
+const MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime';
+const OA_KEY = process.env.OPENAI_API_KEY;
 
-app.get('/', async () => 'OK')
-app.get('/health', async () => ({ ok: true, ts: Date.now() }))
+if (!OA_KEY) {
+  console.error('❌ Missing OPENAI_API_KEY in environment');
+  process.exit(1);
+}
 
-// Twilio webhook (24/7)
-app.post('/voice', async (req, reply) => {
-  const host = req.headers['x-forwarded-host'] || req.hostname
-  const scheme = 'wss'
-  reply
-    .header('Content-Type', 'text/xml')
-    .send(`
-      <Response>
-        <Say voice="alice">Connecting you to our assistant now.</Say>
-        <Connect><Stream url="${scheme}://${host}/media" /></Connect>
-      </Response>
-    `)
-})
+// Accept regular urlencoded bodies…
+fastify.register(formbody);
 
-// WS bridge
-app.get('/media', { websocket: true }, (twilioWS /*, req*/) => {
-  let streamSid = null
-  let closed = false
+// …and ALSO accept urlencoded bodies that include charset (what Twilio sends)
+// Example: "application/x-www-form-urlencoded; charset=UTF-8"
+fastify.addContentTypeParser(
+  /^application\/x-www-form-urlencoded(?:;.*)?$/i,
+  { parseAs: 'string' },
+  (req, body, done) => {
+    // We don't actually need the POST body for /voice, so just acknowledge it.
+    done(null, {});
+  }
+);
 
-  // Connect to OpenAI
-  const oa = new WebSocket(OPENAI, {
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      'OpenAI-Beta': 'realtime=v1'
+// Simple health check
+fastify.get('/', async () => 'OK');
+
+// Twilio webhook -> return TwiML that starts Media Streams
+fastify.post('/voice', async (request, reply) => {
+  try {
+    const host = request.headers['x-forwarded-host'] || request.headers.host;
+    const wsUrl = `wss://${host}/media`;
+
+    const twiml =
+      `<Response>
+        <Say voice="Polly.Salli">Connecting you to our assistant now.</Say>
+        <Connect>
+          <Stream url="${wsUrl}" />
+        </Connect>
+      </Response>`;
+
+    reply.type('text/xml').send(twiml);
+  } catch (err) {
+    console.error('[ERROR /voice]', err);
+    reply.code(500).type('text/plain').send('Internal Server Error');
+  }
+});
+
+// Start HTTP
+fastify.listen({ port: PORT, host: '0.0.0.0' }, () =>
+  console.log(`[BOOT] Fastify up on :${PORT}`)
+);
+
+// WebSocket bridge: /media (Twilio) <-> OpenAI Realtime
+const wss = new WebSocketServer({ server: fastify.server, path: '/media' });
+
+wss.on('connection', (twilioWS) => {
+  console.log('[WSS] Twilio connected -> /media');
+  let streamSid = null;
+
+  // Connect to OpenAI Realtime
+  const oaWS = new WebSocket(
+    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(MODEL)}`,
+    {
+      headers: {
+        Authorization: `Bearer ${OA_KEY}`,
+        'OpenAI-Beta': 'realtime=v1',
+      },
     }
-  })
+  );
 
-  // Heartbeat keepalives
-  const heartbeat = setInterval(() => {
-    try { if (twilioWS.readyState === 1) twilioWS.ping() } catch {}
-    try { if (oa.readyState === 1) oa.ping() } catch {}
-  }, 15000)
-
-  // Configure OA session (correct audio formats)
-  oa.on('open', () => {
-    oa.send(JSON.stringify({
+  oaWS.on('open', () => {
+    console.log('[OA] connected');
+    oaWS.send(JSON.stringify({
       type: 'session.update',
       session: {
         input_audio_format:  'g711_ulaw',
         output_audio_format: 'g711_ulaw',
         instructions:
-          'You are Sofia from Cars & Keys. Be concise and friendly. ' +
-          'Collect name, phone, year make model, service type, and ZIP; confirm back. ' +
-          'If noisy, ask to repeat. End by saying you will text a confirmation.'
+          "You are Sofia from Cars & Keys. Be concise, helpful, and friendly. " +
+          "Always collect name, phone, year/make/model, service type, and ZIP. " +
+          "Confirm details and say you'll text a confirmation."
       }
-    }))
-  })
+    }));
+  });
 
-  // OA -> Twilio audio
-  oa.on('message', (raw) => {
+  oaWS.on('message', (raw) => {
     try {
-      const msg = JSON.parse(raw.toString())
-      if (msg.type === 'response.output_audio.delta' && typeof msg.audio === 'string' && streamSid) {
-        if (twilioWS.readyState === 1) {
-          twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload: msg.audio } }))
+      const msg = JSON.parse(raw.toString());
+      // OpenAI -> Twilio: audio chunks (base64 g711 μ-law)
+      if (msg.type === 'response.output_audio.delta' && typeof msg.audio === 'string') {
+        if (streamSid && twilioWS.readyState === WebSocket.OPEN) {
+          twilioWS.send(JSON.stringify({
+            event: 'media',
+            streamSid,
+            media: { payload: msg.audio }
+          }));
         }
       }
-    } catch {}
-  })
+    } catch (e) { console.error('[OA] parse error', e); }
+  });
 
-  // Twilio -> OA with timer batching (~100ms)
-  let pendingAudio = false
-  const commitTimer = setInterval(() => {
-    if (oa.readyState === 1 && pendingAudio) {
-      oa.send(JSON.stringify({ type: 'input_audio_buffer.commit' }))
-      oa.send(JSON.stringify({ type: 'response.create' }))
-      pendingAudio = false
-    }
-  }, 100)
+  oaWS.on('error', (e) => console.error('[OA] error', e));
+  oaWS.on('close', () => console.log('[OA] closed'));
+
+  // Twilio -> OpenAI
+  let framesSinceCommit = 0;
+  let hadAnyAppend = false;
 
   twilioWS.on('message', (raw) => {
-    try {
-      const msg = JSON.parse(raw.toString())
+    let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-      if (msg.event === 'start') {
-        streamSid = msg.start.streamSid
-        if (oa.readyState === 1) oa.send(JSON.stringify({ type: 'response.create' })) // greeting
+    if (msg.event === 'start') {
+      streamSid = msg.start?.streamSid;
+      console.log('[WSS] stream start', streamSid);
+      framesSinceCommit = 0;
+      hadAnyAppend = false;
+      if (oaWS.readyState === WebSocket.OPEN) {
+        oaWS.send(JSON.stringify({ type: 'response.create' }));
       }
+    }
 
-      if (msg.event === 'media' && msg.media?.payload && oa.readyState === 1) {
-        // Append base64 μ-law (string only)
-        oa.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: msg.media.payload }))
-        pendingAudio = true
+    if (msg.event === 'media' && msg.media?.payload && oaWS.readyState === WebSocket.OPEN) {
+      oaWS.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: msg.media.payload }));
+      hadAnyAppend = true;
+      framesSinceCommit += 1;
+
+      if (framesSinceCommit >= 5) {
+        oaWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+        oaWS.send(JSON.stringify({ type: 'response.create' }));
+        framesSinceCommit = 0;
       }
+    }
 
-      if (msg.event === 'stop' && oa.readyState === 1) {
-        if (pendingAudio) {
-          oa.send(JSON.stringify({ type: 'input_audio_buffer.commit' }))
-          pendingAudio = false
-        }
-        oa.send(JSON.stringify({ type: 'response.create' }))
+    if (msg.event === 'stop') {
+      console.log('[WSS] stream stop');
+      if (oaWS.readyState === WebSocket.OPEN) {
+        if (hadAnyAppend) oaWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+        oaWS.send(JSON.stringify({ type: 'response.create' }));
       }
-    } catch {}
-  })
+    }
+  });
 
-  const cleanup = () => {
-    if (closed) return
-    closed = true
-    clearInterval(heartbeat)
-    clearInterval(commitTimer)
-    try { if (twilioWS.readyState === 1) twilioWS.close() } catch {}
-    try { if (oa.readyState === 1) oa.close() } catch {}
-  }
+  twilioWS.on('close', () => {
+    console.log('[WSS] Twilio WS closed');
+    try { if (oaWS.readyState === WebSocket.OPEN) oaWS.close(); } catch {}
+  });
 
-  twilioWS.on('close', cleanup)
-  twilioWS.on('error', cleanup)
-  oa.on('close', cleanup)
-  oa.on('error', cleanup)
-})
-
-// graceful shutdown
-const closeSignals = ['SIGINT','SIGTERM']
-closeSignals.forEach(sig => process.on(sig, async () => {
-  try { await app.close() } finally { process.exit(0) }
-}))
-
-app.listen({ port: PORT, host: '0.0.0.0' })
-  .then(() => console.log(`[BOOT] Fastify up on :${PORT}`))
-  .catch((e) => { console.error(e); process.exit(1) })
+  twilioWS.on('error', (e) => console.error('[WSS] error', e));
+});
