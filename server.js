@@ -1,34 +1,22 @@
-// server.js — Twilio <-> OpenAI Realtime voice bridge (24/7) with diagnostics
+// server.js — Twilio <-> OpenAI Realtime (with ECHO diagnostic + verbose logs)
 require('dotenv').config()
 const express = require('express')
 const { WebSocketServer, WebSocket } = require('ws')
 
 const PORT  = process.env.PORT || 3000
 const MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime'
+const DIAG_ECHO = String(process.env.DIAG_ECHO || '0') === '1' // echo incoming audio back to caller
 
-/* -------------------- HTTP / Twilio webhook -------------------- */
 const app = express()
 app.set('trust proxy', true)
 app.use(express.json())
 app.use(express.urlencoded({ extended: false }))
 app.use((req, _res, next) => { console.log(`[HTTP] ${req.method} ${req.url}`); next() })
-
 app.get('/', (_req, res) => res.send('OK'))
 
-// Pure Twilio TTS (sanity check that Twilio can play audio)
-app.post('/voice-test', (req, res) => {
-  console.log('[VOICE-TEST] hit /voice-test')
-  res.type('text/xml').send(`
-    <Response>
-      <Say voice="alice">This is a Twilio test. If you hear this, Twilio playback works. Goodbye.</Say>
-      <Hangup/>
-    </Response>
-  `)
-})
-
-// Always-open voice webhook (24/7 streaming to OpenAI)
+// Always connect 24/7
 app.post('/voice', (req, res) => {
-  console.log('[VOICE] hit /voice (24/7 mode)')
+  console.log('[VOICE] hit /voice (24/7)')
   res.type('text/xml').send(`
     <Response>
       <Say voice="alice">Connecting you to our assistant now.</Say>
@@ -40,142 +28,128 @@ app.post('/voice', (req, res) => {
 })
 
 const server = app.listen(PORT, () => console.log(`[BOOT] HTTP up on :${PORT}`))
-
-/* -------------------- WebSocket bridge -------------------- */
 const wss = new WebSocketServer({ server, path: '/media' })
 
 wss.on('connection', (twilioWS) => {
-  console.log('[WSS] Twilio connected to /media')
-  let streamSid = null
+  console.log('────────────────────────────────────────────────────────')
+  console.log('[WSS] Twilio connected /media')
 
-  // Connect to OpenAI Realtime
-  const openaiWS = new WebSocket(
+  let streamSid = null
+  let framesIn = 0
+  let commits = 0
+  let oaAudioOut = 0
+  let framesSinceCommit = 0
+  let appendedSinceCommit = false
+  let oaBusy = false
+
+  // Connect OA
+  const oa = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(MODEL)}`,
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        'OpenAI-Beta': 'realtime=v1'
-      }
-    }
+    { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' } }
   )
 
-  /* ---- OpenAI events ---- */
-  openaiWS.on('open', () => {
-    console.log('[OA] connected (session.update -> μ-law @ 8kHz)')
-    // Formats must be strings for some server versions
-    openaiWS.send(JSON.stringify({
+  const safeCreateResponse = (why) => {
+    if (oa.readyState !== WebSocket.OPEN) return
+    if (oaBusy) return
+    oaBusy = true
+    console.log(`[OA] response.create (${why})`)
+    oa.send(JSON.stringify({ type: 'response.create' }))
+  }
+
+  oa.on('open', () => {
+    console.log('[OA] connected')
+    oa.send(JSON.stringify({
       type: 'session.update',
       session: {
         input_audio_format:  'g711_ulaw',
         output_audio_format: 'g711_ulaw',
         instructions:
-          "You are Sofia from Cars & Keys. Be concise, helpful, and friendly. " +
-          "Always collect: name, callback phone, year make model, service type, and ZIP code. " +
-          "Confirm details back. If line is noisy, ask to repeat."
+          "You are Sofia from Cars & Keys. Be concise and friendly. " +
+          "Collect caller name, callback phone, year make model, requested service, and ZIP. " +
+          "Confirm details and say you'll text a confirmation."
       }
     }))
-
-    // Proactively ask OA to greet
-    openaiWS.send(JSON.stringify({ type: 'response.create' }))
   })
 
-  openaiWS.on('message', (raw) => {
+  oa.on('message', (raw) => {
     let msg
-    try { msg = JSON.parse(raw.toString()) } catch (e) {
-      console.error('[OA] parse error', e)
-      return
+    try { msg = JSON.parse(raw.toString()) } catch { return }
+
+    if (msg.type === 'response.created')  { oaBusy = true }
+    if (msg.type === 'response.completed' || msg.type === 'response.stopped' || msg.type === 'response.error') {
+      oaBusy = false
     }
 
-    // Log important events
-    if (msg.type === 'error')        console.error('[OA ERROR]', msg)
-    if (msg.type === 'response.refusal.delta') console.log('[OA refusal]', msg.delta)
-    if (msg.type === 'response.output_text.delta') {
-      // uncomment for verbose text deltas:
-      // console.log('[OA text]', msg.delta)
-    }
-
-    // OA -> Twilio audio delta (handle both shapes)
-    if (msg.type === 'response.output_audio.delta') {
-      const base64 =
-        (typeof msg.audio === 'string') ? msg.audio
-        : (msg.audio && typeof msg.audio.data === 'string') ? msg.audio.data
-        : null
-
-      if (base64 && streamSid && twilioWS.readyState === WebSocket.OPEN) {
-        twilioWS.send(JSON.stringify({
-          event: 'media',
-          streamSid,
-          media: { payload: base64 }
-        }))
+    if (msg.type === 'response.output_audio.delta' && typeof msg.audio === 'string') {
+      oaAudioOut += 1
+      if (streamSid && twilioWS.readyState === WebSocket.OPEN) {
+        twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload: msg.audio } }))
       }
     }
+
+    if (msg.type === 'error') {
+      console.log('[OA ERROR]', JSON.stringify(msg, null, 2))
+    }
   })
 
-  openaiWS.on('error', (e) => console.error('[OA] error', e))
-  openaiWS.on('close', () => console.log('[OA] closed'))
-
-  /* ---- Twilio media -> OpenAI ---- */
-  // Commit after ~160ms (8 frames @ ~20ms/frame) to avoid "buffer too small".
-  const FRAMES_PER_COMMIT = 8
-  let framesSinceCommit = 0
-  let appendedSinceCommit = false
-
-  function commitIfReady() {
-    if (openaiWS.readyState !== WebSocket.OPEN) return
-    if (!appendedSinceCommit) return
-    openaiWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }))
-    openaiWS.send(JSON.stringify({ type: 'response.create' }))
-    framesSinceCommit = 0
-    appendedSinceCommit = false
-    // console.log('[OA] committed audio buffer')
-  }
+  oa.on('error', (e) => console.error('[OA] error', e))
+  oa.on('close', () => console.log('[OA] closed'))
 
   twilioWS.on('message', (raw) => {
-    let data
-    try { data = JSON.parse(raw.toString()) } catch { return }
+    let msg
+    try { msg = JSON.parse(raw.toString()) } catch { return }
 
-    if (data.event === 'start') {
-      streamSid = data.start.streamSid
-      console.log('[WSS] stream start', streamSid)
-      framesSinceCommit = 0
+    if (msg.event === 'start') {
+      streamSid = msg.start?.streamSid
+      framesIn = commits = oaAudioOut = framesSinceCommit = 0
       appendedSinceCommit = false
-      // Also ensure we have a greeting even if no caller audio yet
-      if (openaiWS.readyState === WebSocket.OPEN) {
-        openaiWS.send(JSON.stringify({ type: 'response.create' }))
-      }
+      oaBusy = false
+      console.log(`[WSS] stream start ${streamSid}  (ECHO=${DIAG_ECHO ? 'ON' : 'OFF'})`)
+      safeCreateResponse('greeting') // Let Sofia speak right away
       return
     }
 
-    if (data.event === 'media' && data.media?.payload) {
-      if (openaiWS.readyState === WebSocket.OPEN) {
-        // Append with **explicit format**; some OA builds require it this way.
-        openaiWS.send(JSON.stringify({
-          type: 'input_audio_buffer.append',
-          audio: {
-            data: data.media.payload,   // base64 μ-law from Twilio
-            format: 'g711_ulaw'
-          }
-        }))
+    if (msg.event === 'media') {
+      const b64 = msg.media?.payload
+      framesIn += 1
+
+      // DIAGNOSTIC echo: send caller audio straight back to caller
+      if (DIAG_ECHO && streamSid && twilioWS.readyState === WebSocket.OPEN && typeof b64 === 'string' && b64.length) {
+        twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload: b64 } }))
+      }
+
+      // OA path
+      if (oa.readyState === WebSocket.OPEN && typeof b64 === 'string' && b64.length) {
+        oa.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: b64 }))
         appendedSinceCommit = true
         framesSinceCommit += 1
-        if (framesSinceCommit >= FRAMES_PER_COMMIT) commitIfReady()
+        if (framesSinceCommit >= 5) {          // ~100ms at 8k μ-law
+          commits += 1
+          framesSinceCommit = 0
+          oa.send(JSON.stringify({ type: 'input_audio_buffer.commit' }))
+          safeCreateResponse('after-commit')
+        }
       }
       return
     }
 
-    if (data.event === 'stop') {
-      console.log('[WSS] stream stop')
-      commitIfReady()
-      if (openaiWS.readyState === WebSocket.OPEN) {
-        openaiWS.send(JSON.stringify({ type: 'response.create' }))
+    if (msg.event === 'stop') {
+      console.log(`[WSS] stream stop  frames_in=${framesIn} commits=${commits} oa_audio_out=${oaAudioOut}`)
+      if (oa.readyState === WebSocket.OPEN) {
+        if (appendedSinceCommit) {
+          oa.send(JSON.stringify({ type: 'input_audio_buffer.commit' }))
+          appendedSinceCommit = false
+        }
+        safeCreateResponse('on-stop')
       }
       return
     }
   })
 
   twilioWS.on('close', () => {
-    console.log('[WSS] Twilio WS closed')
-    try { if (openaiWS.readyState === WebSocket.OPEN) openaiWS.close() } catch {}
+    console.log(`[WSS] Twilio WS closed  frames_in=${framesIn} commits=${commits} oa_audio_out=${oaAudioOut}`)
+    try { if (oa.readyState === WebSocket.OPEN) oa.close() } catch {}
+    console.log('────────────────────────────────────────────────────────')
   })
   twilioWS.on('error', (e) => console.error('[WSS] Twilio WS error', e))
 })
